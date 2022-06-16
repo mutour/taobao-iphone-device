@@ -312,6 +312,9 @@ def cmd_applist(args: argparse.Namespace):
 
 def cmd_launch(args: argparse.Namespace):
     d = _udid2device(args.udid)
+    if len(args.run_args) > 0:
+        args.arguments = re.split('\s+', args.run_args)
+
     try:
         pid = d.instruments.app_launch(args.bundle_id,
                                        args=args.arguments,
@@ -693,7 +696,8 @@ _commands = [
                   action='store_true',
                   help='kill app if running'),
              dict(args=["bundle_id"], help="app bundleId"),
-             dict(args=['arguments'], nargs='*', help='app arguments'),
+             # dict(args=['arguments'], nargs='*', help='app arguments'),
+             dict(args=['-a', '--run_args'], help='app launch arguments'),
          ],
          help="launch app with bundle_id"),
     dict(action=cmd_kill,
@@ -830,6 +834,7 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("-v", "--version", action="store_true", help="show current version"),
     parser.add_argument("-u", "--udid", help="specify unique device identifier")
+    parser.add_argument("-a", "--run_args", help="app launch arguments")
     parser.add_argument("--socket", help="usbmuxd listen address, host:port or local-path")
 
     subparser = parser.add_subparsers(dest='subparser')
@@ -864,6 +869,7 @@ def main():
         level=logging.DEBUG if os.getenv("DEBUG") in ("1", "on", "true") else logging.INFO)
 
     global um
+    print('>>>>>>', args)
     um = Usbmux(args.socket)
     actions[args.subparser](args)
     # yapf: enable
