@@ -12,9 +12,10 @@ import os
 import pathlib
 import re
 import shutil
-import ssl
-import sys
 import socket
+import ssl
+import struct
+import sys
 import tempfile
 import threading
 import time
@@ -24,11 +25,12 @@ import zipfile
 from typing import Iterator, Optional, Union
 
 import requests
+from deprecation import deprecated
 from logzero import setup_logger
 from PIL import Image
 from retry import retry
 
-from . import bplist
+from . import bplist, plistlib2
 from ._crash import CrashManager
 from ._imagemounter import ImageMounter, cache_developer_image
 from ._installation import Installation
@@ -40,8 +42,9 @@ from ._safe_socket import *
 from ._sync import Sync
 from ._types import DeviceInfo
 from ._usbmux import Usbmux
-from ._utils import ProgressReader, get_app_dir, set_socket_timeout
+from ._utils import ProgressReader, get_app_dir, set_socket_timeout, semver_compare
 from .exceptions import *
+from .session import Session
 
 logger = logging.getLogger(LOG.main)
 
@@ -114,8 +117,10 @@ class BaseDevice():
                 if d.udid == self._udid:
                     self._info = d
         else:
-            if len(devices) != 1:
-                raise MuxError("Device is not present or multi devices connected")
+            if len(devices) == 0:
+                raise MuxError("No device connected")
+            elif len(devices) > 1:
+                raise MuxError("More then one device connected")
             _d = devices[0]
             self._udid = _d.udid
             self._info = _d
@@ -283,85 +288,56 @@ class BaseDevice():
             self,
             port: int = LOCKDOWN_PORT,  # 0xf27e,
             _ssl: bool = False,
-            ssl_dial_only: bool = False) -> PlistSocket:
-        _port = socket.htons(port)
-        # Same as: ((port & 0xff) << 8) | (port >> 8)
-        del (port)
-
+            ssl_dial_only: bool = False) -> PlistSocketProxy:
         device_id = self.info.device_id
-        conn = self._usbmux.create_connection()
-        payload = {
-            # 'BundleID': 'com.apple.iTunes',
-            'DeviceID': device_id,  # Required
-            'MessageType': 'Connect',  # Required
-            'PortNumber': _port,  # Required
-            'ProgName': PROGRAM_NAME,
-        }
-        logger.debug("Send payload: %s", payload)
-        with set_socket_timeout(conn.get_socket, 10.0):
-            data = conn.send_recv_packet(payload)
-            self._usbmux._check(data)
-            logger.debug("connected to port: %d", _port)
-            if _ssl:
-                conn.switch_to_ssl(self.ssl_pemfile_path)
+        conn = self._usbmux.connect_device_port(device_id, port)
+        if _ssl:
+            with set_socket_timeout(conn.get_socket, 10.0):
+                psock = conn.psock
+                psock.switch_to_ssl(self.ssl_pemfile_path)
                 if ssl_dial_only:
-                    conn.ssl_unwrap()
-            return conn
+                    psock.ssl_unwrap()
+        return conn
 
-    @contextlib.contextmanager
-    def create_session(self) -> PlistSocket:
-        """
-        Create session inside SSLContext
-        """
-        with self.create_inner_connection() as s:  # 62078=0xf27e
-            data = s.send_recv_packet({"Request": "QueryType"})
-            # Expect: {'Request': 'QueryType', 'Type': 'com.apple.mobile.lockdown'}
-            assert data['Type'] == LockdownService.MobileLockdown
+    def create_session(self) -> Session:
+        s = self.create_inner_connection()
+        data = s.send_recv_packet({"Request": "QueryType"})
+        assert data['Type'] == LockdownService.MobileLockdown
+        data = s.send_recv_packet({
+            'Request': 'GetValue',
+            'Key': 'ProductVersion',
+            'Label': PROGRAM_NAME,
+        })
+        # Expect: {'Key': 'ProductVersion', 'Request': 'GetValue', 'Value': '13.4.1'}
 
-            data = s.send_recv_packet({
-                'Request': 'GetValue',
-                'Key': 'ProductVersion',
-                'Label': PROGRAM_NAME,
-            })
-            # Expect: {'Key': 'ProductVersion', 'Request': 'GetValue', 'Value': '13.4.1'}
+        data = s.send_recv_packet({
+            "Request": "StartSession",
+            "HostID": self.pair_record['HostID'],
+            "SystemBUID": self.pair_record['SystemBUID'],
+            "ProgName": PROGRAM_NAME,
+        })
+        if 'Error' in data:
+            if data['Error'] == 'InvalidHostID':
+                # try to repair device
+                self.pair_record = None
+                self.delete_pair_record()
+                self.handshake()
+                # After paired, call StartSession again
+                data = s.send_recv_packet({
+                    "Request": "StartSession",
+                    "HostID": self.pair_record['HostID'],
+                    "SystemBUID": self.pair_record['SystemBUID'],
+                    "ProgName": PROGRAM_NAME,
+                })
+            else:
+                raise MuxError("StartSession", data['Error'])
 
-            data = s.send_recv_packet({
-                "Request": "StartSession",
-                "HostID": self.pair_record['HostID'],
-                "SystemBUID": self.pair_record['SystemBUID'],
-                "ProgName": PROGRAM_NAME,
-            })
-            if 'Error' in data:
-                if data['Error'] == 'InvalidHostID':
-                    # try to repair device
-                    self.pair_record = None
-                    self.delete_pair_record()
-                    self.handshake()
-                    # After paired, call StartSession again
-                    data = s.send_recv_packet({
-                        "Request": "StartSession",
-                        "HostID": self.pair_record['HostID'],
-                        "SystemBUID": self.pair_record['SystemBUID'],
-                        "ProgName": PROGRAM_NAME,
-                    })
-                else:
-                    raise MuxError("StartSession", data['Error'])
-
-            session_id = data['SessionID']
-            if data['EnableSessionSSL']:
-                # tempfile.NamedTemporaryFile is not working well on windows
-                # See: https://stackoverflow.com/questions/6416782/what-is-namedtemporaryfile-useful-for-on-windows
-                s.switch_to_ssl(self.ssl_pemfile_path)
-
-            yield s
-
-            s.send_packet({
-                "Request": "StopSession",
-                "ProtocolVersion": '2',
-                "Label": PROGRAM_NAME,
-                "SessionID": session_id,
-            })
-            s.recv_packet()
+        session_id = data['SessionID']
+        if data['EnableSessionSSL']:
+            # tempfile.NamedTemporaryFile is not working well on windows
+            # See: https://stackoverflow.com/questions/6416782/what-is-namedtemporaryfile-useful-for-on-windows
+            s.psock.switch_to_ssl(self.ssl_pemfile_path)
+        return Session(s, session_id)
 
     def device_info(self, domain: Optional[str] = None) -> dict:
         """
@@ -481,13 +457,45 @@ class BaseDevice():
         # read "ping" message which indicates the crash logs have been moved to a safe harbor
         move_conn = self.start_service(LockdownService.CRASH_REPORT_MOVER_SERVICE)
         ack = b'ping\x00'
-        if ack != move_conn.recvall(len(ack)):
+        if ack != move_conn.psock.recvall(len(ack)):
             raise ServiceError("ERROR: Crash logs could not be moved. Connection interrupted")
 
         copy_conn = self.start_service(LockdownService.CRASH_REPORT_COPY_MOBILE_SERVICE)
         return CrashManager(copy_conn)
 
-    def start_service(self, name: str) -> PlistSocket:
+    def enable_ios16_developer_mode(self):
+        """
+        enabling developer mode on iOS 16
+        """
+        is_developer = self.get_value("DeveloperModeStatus", domain="com.apple.security.mac.amfi")
+        if is_developer:
+            return True
+        if self._send_action_to_amfi_lockdown(action=1) == 0xe6:
+            raise ServiceError("Device is rebooting in order to enable \"Developer Mode\"")
+
+        # https://developer.apple.com/documentation/xcode/enabling-developer-mode-on-a-device
+        resp_code = self._send_action_to_amfi_lockdown(action=0)
+        if resp_code == 0xd9:
+            raise ServiceError("Developer Mode is not opened, to enable Developer Mode goto Settings -> Privacy & Security -> Developer Mode")
+        else:
+            raise ServiceError("Failed to enable \"Developer Mode\"")
+    
+    def _send_action_to_amfi_lockdown(self, action: int) -> int:
+        """
+        Args:
+            action:
+                0: Show "Developer Mode" Tab in Privacy & Security
+                1: Reboot device to dialog of Open "Developer Mode" (经过测试发现只有在设备没设置密码的情况下才能用)
+        """
+        conn = self.start_service(LockdownService.AmfiLockdown)
+        body = plistlib2.dumps({"action": action})
+        payload = struct.pack(">I", len(body)) + body
+        conn.psock.sendall(payload)
+        rawdata = conn.psock.recv()
+        (resp_code,) = struct.unpack(">I", rawdata[:4])
+        return resp_code
+
+    def start_service(self, name: str) -> PlistSocketProxy:
         try:
             return self._unsafe_start_service(name)
         except MuxServiceError:
@@ -496,8 +504,11 @@ class BaseDevice():
             time.sleep(.5)
             return self._unsafe_start_service(name)
 
-    def _unsafe_start_service(self, name: str) -> PlistSocket:
-        with self.create_session() as s:
+    def _unsafe_start_service(self, name: str) -> PlistSocketProxy:
+        with self.create_session() as _s:
+            s: PlistSocketProxy = _s
+            del(_s)
+
             data = s.send_recv_packet({
                 "Request": "StartService",
                 "Service": name,
@@ -535,31 +546,31 @@ class BaseDevice():
     def iter_screenshot(self) -> Iterator[Image.Image]:
         """ take screenshot infinite """
 
-        with self.start_service(LockdownService.MobileScreenshotr) as conn:
-            version_exchange = conn.recv_packet()
-            # Expect recv: ['DLMessageVersionExchange', 300, 0]
+        conn = self.start_service(LockdownService.MobileScreenshotr)
+        version_exchange = conn.recv_packet()
+        # Expect recv: ['DLMessageVersionExchange', 300, 0]
 
+        data = conn.send_recv_packet([
+            'DLMessageVersionExchange', 'DLVersionsOk', version_exchange[1]
+        ])
+        # Expect recv: ['DLMessageDeviceReady']
+        assert data[0] == 'DLMessageDeviceReady'
+
+        while True:
+            # code will be blocked here until next(..) called
             data = conn.send_recv_packet([
-                'DLMessageVersionExchange', 'DLVersionsOk', version_exchange[1]
+                'DLMessageProcessMessage', {
+                    'MessageType': 'ScreenShotRequest'
+                }
             ])
-            # Expect recv: ['DLMessageDeviceReady']
-            assert data[0] == 'DLMessageDeviceReady'
+            # Expect recv: ['DLMessageProcessMessage', {'MessageType': 'ScreenShotReply', ScreenShotData': b'\x89PNG\r\n\x...'}]
+            assert len(data) == 2 and data[0] == 'DLMessageProcessMessage'
+            assert isinstance(data[1], dict)
+            assert data[1]['MessageType'] == "ScreenShotReply"
 
-            while True:
-                # code will be blocked here until next(..) called
-                data = conn.send_recv_packet([
-                    'DLMessageProcessMessage', {
-                        'MessageType': 'ScreenShotRequest'
-                    }
-                ])
-                # Expect recv: ['DLMessageProcessMessage', {'MessageType': 'ScreenShotReply', ScreenShotData': b'\x89PNG\r\n\x...'}]
-                assert len(data) == 2 and data[0] == 'DLMessageProcessMessage'
-                assert isinstance(data[1], dict)
-                assert data[1]['MessageType'] == "ScreenShotReply"
+            png_data = data[1]['ScreenShotData']
 
-                png_data = data[1]['ScreenShotData']
-
-                yield pil_imread(png_data)
+            yield pil_imread(png_data)
 
     @property
     def name(self):
@@ -649,8 +660,10 @@ class BaseDevice():
     def mount_developer_image(self):
         """
         Raises:
-            MuxError
+            MuxError, ServiceError
         """
+        if semver_compare(self.product_version, "15.7") >= 0:
+            self.enable_ios16_developer_mode()
         try:
             if self.imagemounter.is_developer_mounted():
                 logger.info("DeveloperImage already mounted")
@@ -677,18 +690,18 @@ class BaseDevice():
         """
         return pid killed
         """
-        instruments = self.connect_instruments()
-        if isinstance(pid_or_name, int):
-            instruments.app_kill(pid_or_name)
-            return pid_or_name
-        elif isinstance(pid_or_name, str):
-            bundle_id = pid_or_name
-            app_infos = list(self.installation.iter_installed(app_type=None))
-            ps = instruments.app_process_list(app_infos)
-            for p in ps:
-                if p['bundle_id'] == bundle_id:
-                    instruments.app_kill(p['pid'])
-                    return p['pid']
+        with self.connect_instruments() as ts:
+            if isinstance(pid_or_name, int):
+                ts.app_kill(pid_or_name)
+                return pid_or_name
+            elif isinstance(pid_or_name, str):
+                bundle_id = pid_or_name
+                app_infos = list(self.installation.iter_installed(app_type=None))
+                ps = ts.app_process_list(app_infos)
+                for p in ps:
+                    if p['bundle_id'] == bundle_id:
+                        ts.app_kill(p['pid'])
+                        return p['pid']
         return None
 
     def app_kill(self, *args, **kwargs) -> int:
@@ -698,16 +711,16 @@ class BaseDevice():
     def app_start(self,
                   bundle_id: str,
                   args: Optional[list] = [],
-                  kill_running: bool = False) -> int:
+                  kill_running: bool = True) -> int:
         """
         start application
         
         return pid
+
+        Note: kill_running better to True, if set to False, launch 60 times will trigger instruments service stop
         """
-        instruments = self.connect_instruments()
-        return instruments.app_launch(bundle_id,
-                                           args=args,
-                                           kill_running=kill_running)
+        with self.connect_instruments() as ts:
+            return ts.app_launch(bundle_id, args=args, kill_running=kill_running)
 
     def app_install(self, file_or_url: Union[str, typing.IO]) -> str:
         """
@@ -778,7 +791,7 @@ class BaseDevice():
         print("DONE.")
 
         print("Installing {!r} {!r}".format(bundle_id, short_version))
-        self.installation.install(bundle_id, target_path)
+        return self.installation.install(bundle_id, target_path)
 
     def app_uninstall(self, bundle_id: str) -> bool:
         """
@@ -794,6 +807,9 @@ class BaseDevice():
             conn = self.start_service(LockdownService.TestmanagerdLockdown)
         return DTXService(conn)
 
+    # 2022-08-24 add retry delay, looks like sometime can recover
+    # BrokenPipeError(ConnectionError)
+    @retry((ssl.SSLError, socket.timeout, BrokenPipeError), delay=10, jitter=1, tries=3, logger=logging)
     def connect_instruments(self) -> ServiceInstruments:
         """ start service for instruments """
         if self.major_version() >= 14:
@@ -801,19 +817,20 @@ class BaseDevice():
                 LockdownService.InstrumentsRemoteServerSecure)
         else:
             conn = self.start_service(LockdownService.InstrumentsRemoteServer)
+
         return ServiceInstruments(conn)
-
-    @property
-    def instruments(self) -> ServiceInstruments:
+    
+    @deprecated(details="use connect_instruments instead")
+    def instruments_context(self) -> typing.Generator[ServiceInstruments, None, None]:
         return self.connect_instruments()
-
+        
     def _launch_app_runner(self,
                     bundle_id: str,
                     session_identifier: uuid.UUID,
                     env: dict = {},
                     target_app_bundle_id: str = None,
                     logger: logging.Logger = logging,
-                    quit_event: threading.Event = None) -> typing.Tuple[PlistSocket, int]:  # pid
+                    quit_event: threading.Event = None) -> typing.Tuple[ServiceInstruments, int]:  # pid
 
         logger = logging.getLogger(LOG.xctest)
 

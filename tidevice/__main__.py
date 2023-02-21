@@ -22,6 +22,7 @@ from typing import Optional, Union
 import requests
 from logzero import setup_logger
 from tabulate import tabulate
+from loguru import logger as ulogger
 
 from ._device import Device
 from ._imagemounter import cache_developer_image
@@ -85,7 +86,7 @@ def cmd_list(args: argparse.Namespace):
     ds = um.device_list()
     if args.usb:
         ds = [info for info in ds if info.conn_type == ConnectionType.USB]
-    
+
     if args.one:
         for info in ds:
             print(info.udid)
@@ -163,8 +164,9 @@ def cmd_install(args: argparse.Namespace):
     bundle_id = d.app_install(args.filepath_or_url)
 
     if args.launch:
-        pid = d.instruments.app_launch(bundle_id)
-        logger.info("Launch %r, process pid: %d", bundle_id, pid)
+        with d.connect_instruments() as ts:
+            pid = ts.app_launch(bundle_id)
+            logger.info("Launch %r, process pid: %d", bundle_id, pid)
 
 
 def cmd_uninstall(args: argparse.Namespace):
@@ -249,6 +251,7 @@ def cmd_xctest(args: argparse.Namespace):
     Run XCTest required WDA installed.
     """
     if args.debug:
+        ulogger.enable(PROGRAM_NAME)
         setup_logger(LOG.xctest, level=logging.DEBUG)
 
     d = _udid2device(args.udid)
@@ -267,11 +270,11 @@ def cmd_xctest(args: argparse.Namespace):
 def cmd_screenshot(args: argparse.Namespace):
     d = _udid2device(args.udid)
     filename = args.filename or "screenshot.jpg"
-    print("Screenshot saved to", filename)
     d.screenshot().convert("RGB").save(filename)
+    print("Screenshot saved to", filename)
 
 
-def cmd_app_info(args: argparse.Namespace):
+def cmd_appinfo(args: argparse.Namespace):
     d = _udid2device(args.udid)
     info = d.installation.lookup(args.bundle_id)
     if info is None:
@@ -309,17 +312,42 @@ def cmd_applist(args: argparse.Namespace):
         #     (bundle_path, bundle_id, info['DisplayName'],
         #         info.get('Version', ''), info['Type'])))
 
+def cmd_energy(args: argparse.Namespace):
+    d = _udid2device(args.udid)
+    ts = d.connect_instruments()
+    try:
+        pid = ts.app_launch(args.bundle_id,
+                                       args=args.arguments,
+                                       kill_running=args.kill)
+        ts.start_energy_sampling(pid)
+        while True:
+            ret = ts.get_process_energy_stats(pid)
+            if ret != None:
+                print(json.dumps(ret))
+            time.sleep(1.0)
+    except ServiceError as e:
+        sys.exit(e)
 
 def cmd_launch(args: argparse.Namespace):
     d = _udid2device(args.udid)
     if len(args.run_args) > 0:
         args.arguments = re.split('\s+', args.run_args)
 
+
+    env = {}
+    for kv in args.env or []:
+        key, val = kv.split(":", 1)
+        env[key] = val
+    if env:
+        logger.info("App launch env: %s", env)
+
     try:
-        pid = d.instruments.app_launch(args.bundle_id,
-                                       args=args.arguments,
-                                       kill_running=args.kill)
-        print("PID:", pid)
+        with d.connect_instruments() as ts:
+            pid = ts.app_launch(args.bundle_id,
+                                        app_env=env,
+                                        args=args.arguments,
+                                        kill_running=not args.skip_running)
+            print("PID:", pid)
     except ServiceError as e:
         sys.exit(e)
 
@@ -339,8 +367,9 @@ def cmd_kill(args: argparse.Namespace):
 
 def cmd_system_info(args):
     d = _udid2device(args.udid)
-    sinfo = d.instruments.system_info()
-    pprint(sinfo)
+    with d.connect_instruments() as ts:
+        sinfo = ts.system_info()
+        pprint(sinfo)
 
 
 def cmd_battery(args: argparse.Namespace):
@@ -349,7 +378,42 @@ def cmd_battery(args: argparse.Namespace):
     if args.json:
         _print_json(power_info)
     else:
-        pprint(power_info)
+        if power_info['Status'] != "Success":
+            pprint(power_info)
+            return
+        # dump power info
+        info = power_info['Diagnostics']['IORegistry']
+        indexes = (
+            ('CurrentCapacity', '当前电量', '%'),
+            ('CycleCount', '充电次数', '次'),
+            ('AbsoluteCapacity', '当前电量', 'mAh'),
+            ('NominalChargeCapacity', '实际容量', 'mAh'),
+            ('DesignCapacity', '设计容量', 'mAh'),
+            ('NominalChargeCapacity', '电池寿命', lambda cap: '{}%'.format(round(cap / info['DesignCapacity'] * 100))),
+            ('Serial', '序列号', ''),
+            ('Temperature', '电池温度', '/100℃'),
+            ('Voltage', '当前电压', 'mV'),
+            ('BootVoltage', '开机电压', 'mV'),
+            (('AdapterDetails', 'Watts'), '充电器功率', 'W'),
+            (('AdapterDetails', 'Voltage'), '充电器电压', 'mV'),
+            ('InstantAmperage', '当前电流', 'mA'),
+            ('UpdateTime', '更新时间', lambda v: datetime.fromtimestamp(v).strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        # 数据一般20s更新一次
+
+        for keypath, cn_name, unit in indexes:
+            value = info
+            if isinstance(keypath, str):
+                value = info[keypath]
+            else:
+                value = info
+                for key in keypath:
+                    value = value[key]
+            if callable(unit):
+                value = unit(value)
+                unit = ""
+            print("{:10s}{}{}".format(cn_name, value, unit))
+
 
 def cmd_crashreport(args: argparse.Namespace):
     d = _udid2device(args.udid)
@@ -378,6 +442,9 @@ def cmd_developer(args: argparse.Namespace):
                 except requests.HTTPError:
                     break
         #     print("finish cache developer image {}".format(version))
+    elif args.list:
+        d = _udid2device(args.udid)
+        print(d.imagemounter.lookup())
     else:
         d = _udid2device(args.udid)
         d.mount_developer_image()
@@ -425,7 +492,7 @@ def cmd_syslog(args: argparse.Namespace):
     s = d.start_service("com.apple.syslog_relay")
     try:
         while True:
-            text = s.recv().decode('utf-8')
+            text = s.psock.recv().decode('utf-8')
             print(text, end='', flush=True)
     except (BrokenPipeError, IOError):
         # Python flushes standard streams on exit; redirect remaining output
@@ -436,7 +503,7 @@ def cmd_syslog(args: argparse.Namespace):
 
 def cmd_dump_fps(args):
     d = _udid2device(args.udid)
-    for data in d.instruments.iter_opengl_data():
+    for data in d.connect_instruments().iter_opengl_data():
         if isinstance(data, str):
             continue
         fps = data['CoreAnimationFramesPerSecond']
@@ -514,7 +581,8 @@ def cmd_fsync(args: argparse.Namespace):
 def cmd_ps(args: argparse.Namespace):
     d = _udid2device(args.udid)
     app_infos = list(d.installation.iter_installed(app_type=None))
-    ps = list(d.instruments.app_process_list(app_infos))
+    with d.connect_instruments() as ts:
+        ps = list(ts.app_process_list(app_infos))
 
     lens = defaultdict(int)
     json_data = []
@@ -543,7 +611,6 @@ def cmd_ps(args: argparse.Namespace):
 
 
 def cmd_perf(args: argparse.Namespace):
-    assert args.bundle_id
     #print("BundleID:", args.bundle_id)
     from ._perf import Performance
     d = _udid2device(args.udid)
@@ -552,20 +619,27 @@ def cmd_perf(args: argparse.Namespace):
         perfs = []
         for _typename in args.perfs.split(","):
             perfs.append(DataType(_typename))
-    # print(perfs)
+    
+    if (DataType.MEMORY in perfs or DataType.CPU in perfs) and not args.bundle_id:
+        print('\033[1;31m error: the following arguments are required: -B/--bundle_id \033[0m')
+        exit(-1)
+
     perf = Performance(d, perfs=perfs)
 
     def _cb(_type: DataType, data):
-        print(_type.value, data, flush=True)
+        if args.json and _type != DataType.SCREENSHOT:
+            data = json.dumps(data)
+        print(_type.value, data, flush=True) if len(perfs) != 1 else print(data,flush=True)
 
     try:
         perf.start(args.bundle_id, callback=_cb)
         #print("Ctrl-C to finish")
         while True:
             time.sleep(.1)
+    except KeyboardInterrupt:
+        pass
     finally:
         perf.stop()
-
 
 def cmd_set_assistive_touch(args: argparse.Namespace):
     d = _udid2device(args.udid)
@@ -597,9 +671,7 @@ _commands = [
              dict(args=['--json'],
                   action='store_true',
                   help='output in json format'),
-             dict(args=['--usb'],
-                  action='store_true',
-                  help='usb USB device'),
+             dict(args=['--usb'], action='store_true', help='usb USB device'),
              dict(args=['-1'],
                   dest="one",
                   action='store_true',
@@ -636,7 +708,7 @@ _commands = [
     dict(action=cmd_system_info,
          command="sysinfo",
          help="show device system info"),
-    dict(action=cmd_app_info,
+    dict(action=cmd_appinfo,
          command="appinfo",
          flags=[
              dict(args=['--json'],
@@ -648,7 +720,10 @@ _commands = [
     dict(action=cmd_applist,
          command="applist",
          flags=[
-             dict(args=['--type'], default='user', help='filter app with type', choices=['user', 'system', 'all'])
+             dict(args=['--type'],
+                  default='user',
+                  help='filter app with type',
+                  choices=['user', 'system', 'all'])
          ],
          help="list packages"),
     dict(action=cmd_battery,
@@ -692,12 +767,23 @@ _commands = [
     dict(action=cmd_launch,
          command="launch",
          flags=[
+             dict(args=['--skip-running'], action='store_true', help='not kill app if running'),
+             dict(args=["bundle_id"], help="app bundleId"),
+             # dict(args=['arguments'], nargs='*', help='app arguments'),
+             dict(args=['-a', '--run_args'], help='app launch arguments'),
+             dict(args=['-e', '--env'],
+                  action='append',
+                  help="set env with format key:value, support multi -e"),
+         ],
+         help="launch app with bundle_id"),
+    dict(action=cmd_energy,
+         command="energy",
+         flags=[
              dict(args=['--kill'],
                   action='store_true',
                   help='kill app if running'),
              dict(args=["bundle_id"], help="app bundleId"),
-             # dict(args=['arguments'], nargs='*', help='app arguments'),
-             dict(args=['-a', '--run_args'], help='app launch arguments'),
+             dict(args=['arguments'], nargs='*', help='app arguments'),
          ],
          help="launch app with bundle_id"),
     dict(action=cmd_kill,
@@ -785,16 +871,27 @@ _commands = [
     dict(action=cmd_crashreport,
          command="crashreport",
          flags=[
-             dict(args=['-l', '--list'], action='store_true', help='list all crash files'),
-             dict(args=['-k', '--keep'], action='store_true', help="copy but do not remove crash reports from device"),
-             dict(args=['-c', '--clear'], action='store_true', help='clear crash files'),
-             dict(args=['output_directory'], nargs="?", help='The output dir to save crash logs synced from device'),
+             dict(args=['-l', '--list'],
+                  action='store_true',
+                  help='list all crash files'),
+             dict(args=['-k', '--keep'],
+                  action='store_true',
+                  help="copy but do not remove crash reports from device"),
+             dict(args=['-c', '--clear'],
+                  action='store_true',
+                  help='clear crash files'),
+             dict(args=['output_directory'],
+                  nargs="?",
+                  help='The output dir to save crash logs synced from device'),
          ],
          help="crash log tools"),
     dict(action=cmd_dump_fps, command='dumpfps', help='dump fps'),
     dict(action=cmd_developer,
          command="developer",
          flags=[
+             dict(args=["-l", "--list"],
+                  action="store_true",
+                  help="list mount information"),
              dict(args=['--download-all'],
                   action="store_true",
                   help="download all developer to local")
@@ -806,12 +903,15 @@ _commands = [
          command="perf",
          flags=[
              dict(args=['-B', '--bundle_id'],
-                  help='app bundle id',
-                  required=True),
+                  help='app bundle id (cpu/memory required)',
+                  required=False),
              dict(args=['-o'],
                   dest='perfs',
                   help='cpu,memory,fps,network,screenshot. separate by ","',
                   required=False),
+            dict(args=['--json'],
+                  action='store_true',
+                  help='format output as json'),
          ],
          help="performance of app"),
     dict(action=cmd_set_assistive_touch,
@@ -834,8 +934,8 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("-v", "--version", action="store_true", help="show current version"),
     parser.add_argument("-u", "--udid", help="specify unique device identifier")
-    parser.add_argument("-a", "--run_args", help="app launch arguments")
     parser.add_argument("--socket", help="usbmuxd listen address, host:port or local-path")
+    parser.add_argument("--trace", action="store_true", help="show trace info")
 
     subparser = parser.add_subparsers(dest='subparser')
     actions = {}
@@ -864,6 +964,9 @@ def main():
         # show_upgrade_message()
         return
 
+    if args.trace:
+        ulogger.enable(PROGRAM_NAME)
+        
     # log setup
     setup_logger(LOG.main,
         level=logging.DEBUG if os.getenv("DEBUG") in ("1", "on", "true") else logging.INFO)

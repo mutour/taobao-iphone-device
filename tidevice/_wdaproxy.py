@@ -4,6 +4,7 @@
 """
 
 import abc
+import functools
 import logging
 import subprocess
 import sys
@@ -14,7 +15,6 @@ import traceback
 
 import logzero
 import requests
-from cached_property import cached_property
 
 from . import requests_usbmux
 from ._device import Device
@@ -23,9 +23,9 @@ from .exceptions import MuxReplyError
 
 
 class WDAService:
-    _DEFAULT_TIMEOUT = 30 # http request timeout
+    _DEFAULT_TIMEOUT = 90 # http request timeout
 
-    def __init__(self, d: Device, bundle_id: str = "com.*.xctrunner", env: dict={}, check_interval: float = 60):
+    def __init__(self, d: Device, bundle_id: str = "com.*.xctrunner", env: dict={}):
         self._d = d
         self._bundle_id = bundle_id
         self._service = ThreadService(self._keep_wda_running)
@@ -38,7 +38,8 @@ class WDAService:
     def udid(self) -> str:
         return self._d.udid
 
-    @cached_property
+    @property
+    @functools.lru_cache(None)
     def logger(self) -> logging.Logger:
         log_format = f'%(color)s[%(levelname)1.1s %(asctime)s %(module)s:%(lineno)d] [{self.udid}]%(end_color)s %(message)s'
         formatter = logzero.LogFormatter(fmt=log_format)
@@ -53,7 +54,8 @@ class WDAService:
                 if resp.status_code != 200:
                     return False
                 return resp.text.strip() == "I-AM-ALIVE"
-        except requests.RequestException:
+        except requests.RequestException as e:
+            self.logger.debug("request error: %s", e)
             return False
         except MuxReplyError as e:
             if e.reply_code != UsbmuxReplyCode.ConnectionRefused:
@@ -66,10 +68,11 @@ class WDAService:
     def _wait_ready(self,
                     proc,
                     stop_event: threading.Event,
-                    timeout: float = 30.0) -> bool:
+                    timeout: float = 60.0) -> bool:
         deadline = time.time() + timeout
         while not stop_event.is_set() and time.time() < deadline:
-            if self._is_alive():
+            alive = self._is_alive()
+            if alive:
                 return True
 
             if proc.poll() is not None:  # program quit
@@ -78,7 +81,7 @@ class WDAService:
         return False
 
     def _wait_until_quit(self,
-                         proc,
+                         proc: subprocess.Popen,
                          stop_event: threading.Event,
                          check_interval: float = 30.0) -> float:
         """

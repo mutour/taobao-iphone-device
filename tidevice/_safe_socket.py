@@ -2,7 +2,7 @@
 # codeskyblue 2020/06/03
 #
 
-__all__ = ['SafeStreamSocket', 'PlistSocket']
+__all__ = ['SafeStreamSocket', 'PlistSocket', 'PlistSocketProxy']
 
 import logging
 import os
@@ -19,15 +19,30 @@ from ._proto import PROGRAM_NAME
 from ._utils import set_socket_timeout
 from .exceptions import *
 
-logger = logging.getLogger(PROGRAM_NAME)
+from loguru import logger
+
 
 _n = [0]
 _nlock = threading.Lock()
+_id_numbers = []
 
-def get_uniq_id() -> int:
+def acquire_uid() -> int:
+    _id = None
     with _nlock:
         _n[0] += 1
-        return _n[0]
+        _id_numbers.append(_n[0])
+        _id = _n[0]
+    logger.info("Opening socket: id={}", _id)
+    return _id
+
+
+def release_uid(id: int):
+    try:
+        _id_numbers.remove(id)
+    except ValueError:
+        pass
+    logger.info("Closing socket, id={}", id)
+    
 
 
 class SafeStreamSocket:
@@ -37,7 +52,7 @@ class SafeStreamSocket:
         Args:
             addr: can be /var/run/usbmuxd or (localhost, 27015)
         """
-        self._id = get_uniq_id()
+        self._id = acquire_uid()
         self._sock = None
         self._dup_sock = None # keep original sock when switch_to_ssl
         self._name = None
@@ -59,17 +74,14 @@ class SafeStreamSocket:
             self._sock = socket.socket(family, socket.SOCK_STREAM)
             self._sock.connect(addr)
 
-        def _cleanup():
-            _id = str(self.id)
-            if self.name:
-                _id = self.name + ":" + str(self.id)
-            logger.debug("CLOSE(%s)", _id)
-            self._sock.close()
-            if self._dup_sock:
-                self._dup_sock.close()
-
-        self._finalizer = weakref.finalize(self, _cleanup)
+        self._finalizer = weakref.finalize(self, self._cleanup)
     
+    def _cleanup(self):
+        release_uid(self.id)
+        if self._dup_sock:
+            self._dup_sock.close()
+        self._sock.close()
+
     def close(self):
         self._finalizer()
         
@@ -100,7 +112,7 @@ class SafeStreamSocket:
         while len(buf) < size:
             chunk = self._sock.recv(size - len(buf))
             if not chunk:
-                raise MuxError("socket connection broken")
+                raise ConnectionError("socket connection broken")
             buf.extend(chunk)
         return buf
 
@@ -115,7 +127,7 @@ class SafeStreamSocket:
 
     def switch_to_ssl(self, pemfile):
         """ wrap socket to SSLSocket """
-        # logger.debug("Switch to ssl")
+        logger.debug("Socket({}): switch to ssl", self.id)
         assert os.path.isfile(pemfile)
         
         # https://docs.python.org/zh-cn/3/library/ssl.html#ssl.SSLContext
@@ -166,9 +178,9 @@ class PlistSocket(SafeStreamSocket):
             tag: int
         """
         #if self.is_secure():
-        #    logger.debug(secure_text + " send: %s", payload)
+        #    logger.debug(secure_text + " send: {}", payload)
         #else:
-        logger.debug("SEND(%d): %s", self.id, payload)
+        logger.debug("SEND({}): {}", self.id, payload)
 
         body_data = plistlib.dumps(payload)
         if self._first:  # first package
@@ -196,21 +208,22 @@ class PlistSocket(SafeStreamSocket):
             logger.debug("Recv pair record data ...")
         else:
             # if self.is_secure():
-            #    logger.debug(secure_text + " recv" + Color.END + ": %s",
+            #    logger.debug(secure_text + " recv" + Color.END + ": {}",
             #                 payload)
             # else:
-            logger.debug("RECV(%d): %s", self.id, payload)
+            logger.debug("RECV({}): {}", self.id, payload)
         return payload
 
-    def send_recv_packet(self, payload: dict, timeout: float = 10.0) -> dict:
-        with set_socket_timeout(self.get_socket(), timeout):
-            self.send_packet(payload)
-            return self.recv_packet()
 
+class PlistSocketProxy:
+    def __init__(self, psock: typing.Union[PlistSocket, "PlistSocketProxy"]):
+        if isinstance(psock, PlistSocketProxy):
+            psock._finalizer.detach()
+            self.__dict__.update(psock.__dict__)
+        else:
+            assert isinstance(psock, PlistSocket)
+            self._psock = psock
 
-class PlistSocketProperty:
-    def __init__(self, psock: PlistSocket):
-        self._psock = psock
         self._finalizer = weakref.finalize(self, self._psock.close)
         self.prepare()
     
@@ -218,8 +231,19 @@ class PlistSocketProperty:
     def psock(self) -> PlistSocket:
         return self._psock
     
+    @property
+    def name(self) -> str:
+        return self.psock.name
+    
+    @name.setter
+    def name(self, new_name: str):
+        self.psock.name = new_name
+    
     def prepare(self):
         pass
+
+    def get_socket(self) -> socket.socket:
+        return self.psock.get_socket()
 
     def send_packet(self, payload: dict, message_type: int = 8):
         return self.psock.send_packet(payload, message_type)
@@ -227,6 +251,17 @@ class PlistSocketProperty:
     def recv_packet(self, header_size=None) -> dict:
         return self.psock.recv_packet(header_size)
     
+    def send_recv_packet(self, payload: dict, timeout: float = 10.0) -> dict:
+        with set_socket_timeout(self.psock.get_socket(), timeout):
+            self.send_packet(payload)
+            return self.recv_packet()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
     def close(self):
         self._finalizer()
     
